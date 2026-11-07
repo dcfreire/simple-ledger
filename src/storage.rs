@@ -1,4 +1,4 @@
-use std::marker::PhantomData;
+use std::{marker::PhantomData, path::Path};
 
 use serde::{Serialize, de::DeserializeOwned};
 use sled::{Transactional, transaction::ConflictableTransactionError};
@@ -81,7 +81,11 @@ pub struct SledLedger {
 
 impl SledLedger {
     pub fn open() -> anyhow::Result<Self> {
-        let db = sled::open("./data")?;
+        Self::open_at("./data")
+    }
+
+    pub fn open_at(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let db = sled::open(path)?;
         let accounts = Db::open(db.open_tree("accounts")?);
         let transactions = Db::open(db.open_tree("transactions")?);
         let disputes = Db::open(db.open_tree("disputes")?);

@@ -12,12 +12,27 @@ use simple_ledger::{Ledger, SledLedger};
 struct Args {
     /// Path to the CSV file with `type,client,tx,amount` rows to ingest
     input: PathBuf,
+    /// Reuse the persistent ledger in ./data instead of a temporary ledger
+    #[arg(long)]
+    persistent: bool,
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let ledger = SledLedger::open()?;
     let input = File::open(&args.input)?;
+    let directory = if args.persistent {
+        None
+    } else {
+        Some(
+            tempfile::Builder::new()
+                .prefix("simple-ledger-")
+                .tempdir()?,
+        )
+    };
+    let ledger = match &directory {
+        Some(directory) => SledLedger::open_at(directory.path())?,
+        None => SledLedger::open()?,
+    };
     let progress = ProgressBar::new(input.metadata()?.len());
 
     progress.set_style(

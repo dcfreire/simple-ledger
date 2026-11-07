@@ -18,6 +18,6 @@ withdrawal,1,2,0.5000
 
 Output columns are `client,available,held,total,locked`. Progress and skipped-row errors are written to stderr.
 
-The ledger persists in `./data`. Later runs reuse those accounts and transaction IDs.
+By default, each run uses an isolated temporary ledger, removed on normal exit. Add `--persistent` to reuse `./data` across runs; concurrent persistent runs cannot share the database.
 
 Tests and this README were generated with pi.dev using GPT 6 Terra.

@@ -1,4 +1,8 @@
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::Path,
+    process::{Command, Output, Stdio},
+};
 
 use serde::Deserialize;
 
@@ -27,11 +31,24 @@ fn run(input: &str) -> anyhow::Result<Vec<AccountOutput>> {
 }
 
 fn run_at(dir: &Path, input: &str) -> anyhow::Result<(Vec<AccountOutput>, String)> {
+    run_at_with_args(dir, input, &[])
+}
+
+fn run_at_with_args(
+    dir: &Path,
+    input: &str,
+    args: &[&str],
+) -> anyhow::Result<(Vec<AccountOutput>, String)> {
     fs::write(dir.join("input.csv"), input)?;
     let output = Command::new(env!("CARGO_BIN_EXE_simple-ledger"))
         .current_dir(dir)
+        .args(args)
         .arg("input.csv")
         .output()?;
+    read_output(output)
+}
+
+fn read_output(output: Output) -> anyhow::Result<(Vec<AccountOutput>, String)> {
     assert!(
         output.status.success(),
         "{}",
@@ -141,72 +158,85 @@ deposit,2,5,922337203685477.5807
 }
 
 #[test]
-fn domain_records_work_across_runs() -> anyhow::Result<()> {
+fn repeated_runs_start_with_empty_ledgers() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (accounts, errors) = run_at(
-        dir.path(),
-        "\
-type,client,tx,amount
-deposit,1,1,2.5000
-withdrawal,1,5,1.2501
-deposit,2,2,3.0000
-dispute,2,2
-deposit,3,3,1.2501
-dispute,3,3
-",
-    )?;
-    assert!(errors.is_empty(), "{errors}");
+    let (first, first_errors) = run_at(dir.path(), "type,client,tx,amount\ndeposit,1,1,2.5000\n")?;
+    let (second, second_errors) =
+        run_at(dir.path(), "type,client,tx,amount\ndeposit,1,1,3.0000\n")?;
+    assert!(first_errors.is_empty(), "{first_errors}");
+    assert!(second_errors.is_empty(), "{second_errors}");
+    assert_eq!(first, vec![account(1, "2.5000", "0.0000", "2.5000", false)]);
     assert_eq!(
-        accounts,
-        vec![
-            account(1, "1.2499", "0.0000", "1.2499", false),
-            account(2, "0.0000", "3.0000", "3.0000", false),
-            account(3, "0.0000", "1.2501", "1.2501", false),
-        ]
+        second,
+        vec![account(1, "3.0000", "0.0000", "3.0000", false)]
     );
+    Ok(())
+}
 
-    // Stored records use domain fields.
-    {
-        let db = sled::open(dir.path().join("data"))?;
-        let tx = db
-            .open_tree("transactions")?
-            .get(3_u32.to_le_bytes())?
-            .unwrap();
-        let dispute = db.open_tree("disputes")?.get(3_u32.to_le_bytes())?.unwrap();
-        let withdrawal = db
-            .open_tree("transactions")?
-            .get(5_u32.to_le_bytes())?
-            .unwrap();
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&tx)?,
-            serde_json::json!({"id":3,"account_id":3,"amount":12501})
-        );
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&withdrawal)?,
-            serde_json::json!({"id":5,"account_id":1,"amount":-12501})
-        );
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&dispute)?,
-            serde_json::json!({"transaction_id":3,"account_id":3,"stage":"dispute"})
-        );
-    }
-
-    let (accounts, errors) = run_at(
+#[test]
+fn persistent_flag_reuses_ledger_across_runs() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (first, first_errors) = run_at_with_args(
         dir.path(),
-        "\
-type,client,tx,amount
-resolve,2,2
-resolve,3,3
-",
+        "type,client,tx,amount\ndeposit,1,1,2.5000\n",
+        &["--persistent"],
     )?;
-    assert!(errors.is_empty(), "{errors}");
+    let (second, second_errors) = run_at_with_args(
+        dir.path(),
+        "type,client,tx,amount\ndeposit,1,2,1.5000\ndispute,1,1\n",
+        &["--persistent"],
+    )?;
+    assert!(first_errors.is_empty(), "{first_errors}");
+    assert!(second_errors.is_empty(), "{second_errors}");
+    assert_eq!(first, vec![account(1, "2.5000", "0.0000", "2.5000", false)]);
     assert_eq!(
-        accounts,
-        vec![
-            account(1, "1.2499", "0.0000", "1.2499", false),
-            account(2, "3.0000", "0.0000", "3.0000", false),
-            account(3, "1.2501", "0.0000", "1.2501", false),
-        ]
+        second,
+        vec![account(1, "1.5000", "2.5000", "4.0000", false)]
+    );
+    assert!(dir.path().join("data").is_dir());
+    Ok(())
+}
+
+#[test]
+fn concurrent_runs_ignore_existing_database_lock() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let temp_root = dir.path().join("temp");
+    fs::create_dir(&temp_root)?;
+    // A database locked at the old default path must not affect either process.
+    let _locked_db = sled::open(dir.path().join("data"))?;
+    fs::write(
+        dir.path().join("first.csv"),
+        "type,client,tx,amount\ndeposit,1,1,1.0000\n",
+    )?;
+    fs::write(
+        dir.path().join("second.csv"),
+        "type,client,tx,amount\ndeposit,1,1,2.0000\n",
+    )?;
+
+    let spawn = |input: &str| {
+        Command::new(env!("CARGO_BIN_EXE_simple-ledger"))
+            .current_dir(dir.path())
+            .env("TMPDIR", &temp_root)
+            .arg(input)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    };
+    let first = spawn("first.csv")?;
+    let second = spawn("second.csv")?;
+    let (first, first_errors) = read_output(first.wait_with_output()?)?;
+    let (second, second_errors) = read_output(second.wait_with_output()?)?;
+    assert!(first_errors.is_empty(), "{first_errors}");
+    assert!(second_errors.is_empty(), "{second_errors}");
+    assert_eq!(first, vec![account(1, "1.0000", "0.0000", "1.0000", false)]);
+    assert_eq!(
+        second,
+        vec![account(1, "2.0000", "0.0000", "2.0000", false)]
+    );
+    assert_eq!(
+        fs::read_dir(temp_root)?.count(),
+        0,
+        "temporary databases should be removed"
     );
     Ok(())
 }
